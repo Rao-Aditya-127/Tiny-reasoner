@@ -1,0 +1,15 @@
+# Core ML stack. On the GPU box, install a CUDA torch wheel separately, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/cu124
+# then: pip install -r requirements.txt
+torch>=2.2
+transformers>=4.44
+datasets>=2.20
+peft>=0.12
+accelerate>=0.33
+matplotlib>=3.8
+
+# Optional experiment logging (enabled via Config.use_wandb)
+wandb>=0.17
+
+# Dev / tests
+pytest>=8.0
