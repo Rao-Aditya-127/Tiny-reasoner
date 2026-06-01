@@ -217,4 +217,98 @@ honest "before" number.
 
 ---
 
-<!-- Phase 1 entry goes here -->
+### Phase 1 — Data, rewards & baseline eval
+
+> The plan calls this "the most underrated phase." Here's why in one line: **RL
+> optimizes whatever the reward says.** If the scorer is buggy, the model will
+> happily learn the bug. And you can't claim "improved from X% to Y%" without a
+> trustworthy X. So this phase is really about building a *referee* we trust.
+
+#### What we did
+Three pieces: load the math dataset, write the "scorer" (reward functions), and
+build an evaluation script that measures the model's accuracy.
+
+| File | What it is, in plain terms |
+|------|----------------------------|
+| `data.py` | Loads GSM8K (grade-school math problems), pulls out the gold answer (the number after `####`), and formats each question into a prompt that tells the model to answer as `<think> ...reasoning... </think><answer> 72 </answer>`. |
+| `rewards.py` | The referee. Reads a model's answer, finds the final number, and scores it: **1.0 if it matches the gold answer, 0 otherwise**, plus a small **0.1 bonus** for using the tags correctly. |
+| `tests/test_rewards.py` | 29 hand-checked tests so we *know* the referee is fair (commas, dollar signs, negatives, fractions, answer written twice, no answer...). |
+| `eval.py` | Asks the model N held-out questions, scores them, prints accuracy. This is our "before/after" measuring stick. |
+
+#### Why we did this (plain English)
+
+**Why a strict output format (`<think>`/`<answer>`)?** If we let the model answer
+however it likes, finding "the final answer" in a wall of text is guesswork. By
+*asking* for the answer inside `<answer></answer>` tags, extraction becomes
+reliable. The small format bonus gently teaches the model to comply — but we keep
+it tiny (0.1 vs 1.0) so the model can never get a good score just by formatting
+nicely while getting the math wrong. (That failure mode — optimizing the easy part
+of the reward and ignoring the hard part — is called **reward hacking**, and
+guarding against it is why correctness >> format.)
+
+**Why "verifiable rewards"?** For math, we can *check* the answer with a simple
+comparison — no opinion, no second AI judging quality. This is what makes RL stable
+here: the reward is a fact, not a guess. (Contrast: rewarding "good writing" needs a
+learned reward model, which can be gamed. Math can't.)
+
+**Why so many tests?** Because the referee is the foundation everything stands on.
+A subtle bug like "`1,000` ≠ `1000`" would make correct answers score 0, the reward
+signal would be garbage, and we'd waste GPU money chasing a phantom. The tests pin
+down exactly how every messy real-world answer string should be scored.
+
+**Why measure a baseline now?** The whole project's headline is "X% → Y%." We need
+an honest, reproducible X *before* training touches the model. We decode greedily
+(temperature 0) so the number is deterministic — not a lucky or unlucky sample.
+
+#### How it's used later
+- `build_prompt` (data.py) is how every question enters the model — in eval *and* in
+  the Phase 2 rollout engine.
+- `total_reward` (rewards.py) is called on every single generated answer in Phase 4's
+  training loop. It is *the* signal GRPO optimizes.
+- `evaluate` (eval.py) gets called at intervals during Phase 5 training to draw the
+  accuracy-over-time curve that is our final result.
+
+#### Design choices worth noting
+- **Take the *last* `<answer>` block.** Models often restate the answer; the last one
+  is the final commitment, so `findall(...)[-1]`.
+- **Normalize before comparing.** `$1,072`, `1072`, and `1072.0` all collapse to the
+  same canonical string via Python's `Fraction`, which cleanly handles ints,
+  decimals, and fractions (`1/2 → 0.5`) in one code path.
+- **Extraction priority:** `<answer>` tag → `\boxed{}` → last number in the text.
+  The fallbacks mean even a non-compliant completion still gets a fair shot at being
+  scored correct.
+
+#### Problems hit & how we fixed them
+
+**Problem — `pytest` wasn't installed.** Running the test suite failed with
+`No module named pytest`. **Fix:** `pip install pytest` (it's a dev-only dependency,
+already listed in `requirements.txt`). Tests then passed 29/29.
+
+*No conceptual bugs this phase* — the upfront test cases caught nothing broken,
+which is exactly the point of writing them first.
+
+#### Checkpoint (what "done" looks like)
+```
+$ python -m pytest tests/test_rewards.py -q
+29 passed in 0.16s
+
+$ python eval.py --config tiny
+[eval] SmolLM2-135M on 8 test examples (greedy=True)
+[eval] accuracy = 0.125  format_rate = 0.000
+```
+The pipeline runs end-to-end on CPU. Two things to read from that output:
+1. **format_rate = 0** — the tiny model ignores our tag format entirely and just
+   writes prose. That's fine; it's the "before" state. Getting that rate up is part
+   of what training will do.
+2. **accuracy = 0.125** — this is the *tiny smoke model's* score on 8 examples, **not**
+   our real baseline. The honest baseline "X%" must be measured on the GPU box with
+   `python eval.py --config gpu --set eval_n=200` (Qwen2.5-1.5B, 200 examples). We'll
+   record that number when we first rent the GPU.
+
+**Status: ✅ Phase 1 done.** Next: Phase 2 — the rollout engine, where we sample
+*groups* of answers and compute per-token log-probabilities (the most bug-prone part
+of the whole project).
+
+---
+
+<!-- Phase 2 entry goes here -->
