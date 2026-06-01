@@ -26,17 +26,27 @@ from utils import load_model_and_tokenizer, set_seed
 
 @torch.no_grad()
 def evaluate(model, tokenizer, device, examples, cfg, *, dump=3):
-    """Greedy-decode each example, score it, return (accuracy, format_rate, rows).
+    """Decode examples in batches, score them, return (accuracy, format_rate, rows).
 
-    ``dump`` controls how many sample completions to print for eyeballing.
+    We generate ``eval_batch_size`` prompts at once. Single-sequence decoding
+    barely uses the GPU (kernel-launch bound) and is very slow; batching with
+    left-padding keeps the GPU busy and prints running progress so the run is
+    never mistaken for a hang. ``dump`` controls how many samples to print.
     """
     n_correct = 0
     n_format = 0
     rows = []
     greedy = cfg.eval_temperature == 0.0
-    for i, ex in enumerate(examples):
-        prompt = build_prompt(ex.question, tokenizer)
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    bs = max(1, cfg.eval_batch_size)
+    n = len(examples)
+
+    for start in range(0, n, bs):
+        batch = examples[start:start + bs]
+        prompts = [build_prompt(ex.question, tokenizer) for ex in batch]
+        # Left-padding (set on the tokenizer) means every row's generation starts
+        # at the same index, so we can slice off the shared prompt width below.
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
+        prompt_len = inputs["input_ids"].shape[1]
         out = model.generate(
             **inputs,
             max_new_tokens=cfg.max_new_tokens,
@@ -45,20 +55,25 @@ def evaluate(model, tokenizer, device, examples, cfg, *, dump=3):
             top_p=None if greedy else cfg.top_p,
             pad_token_id=tokenizer.pad_token_id,
         )
-        completion = tokenizer.decode(
-            out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
-        )
-        _, parts = total_reward(completion, ex.gold, cfg)
-        n_correct += int(parts["is_correct"])
-        n_format += int(parts["format"] > 0)
-        rows.append((ex, completion, parts))
-        if i < dump:
-            print(f"\n--- sample {i} ---")
-            print("Q:", ex.question[:120].replace("\n", " "))
-            print("gold:", ex.gold, "| pred:", extract_answer(completion))
-            print("completion:", completion[:300].replace("\n", " "))
+        gen = out[:, prompt_len:]
+        completions = tokenizer.batch_decode(gen, skip_special_tokens=True)
 
-    n = len(examples)
+        for j, (ex, completion) in enumerate(zip(batch, completions)):
+            _, parts = total_reward(completion, ex.gold, cfg)
+            n_correct += int(parts["is_correct"])
+            n_format += int(parts["format"] > 0)
+            rows.append((ex, completion, parts))
+            idx = start + j
+            if idx < dump:
+                print(f"\n--- sample {idx} ---")
+                print("Q:", ex.question[:120].replace("\n", " "))
+                print("gold:", ex.gold, "| pred:", extract_answer(completion))
+                print("completion:", completion[:300].replace("\n", " "))
+
+        done = min(start + bs, n)
+        print(f"[eval] {done}/{n}  running_acc={n_correct / done:.3f}  "
+              f"format_rate={n_format / done:.3f}", flush=True)
+
     return n_correct / n, n_format / n, rows
 
 

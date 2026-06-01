@@ -284,30 +284,75 @@ an honest, reproducible X *before* training touches the model. We decode greedil
 `No module named pytest`. **Fix:** `pip install pytest` (it's a dev-only dependency,
 already listed in `requirements.txt`). Tests then passed 29/29.
 
-*No conceptual bugs this phase* — the upfront test cases caught nothing broken,
-which is exactly the point of writing them first.
+**Problem — eval "looked stuck" on the GPU and barely used the GPU.** On the first
+real GPU run, eval printed 3 sample completions and then appeared frozen, with low
+GPU utilization. Two causes:
+1. *No progress output.* We only dumped the first 3 samples, then silently generated
+   the remaining ~197 — many minutes of zero output that looked like a hang.
+2. *Batch size 1.* We generated one prompt at a time. Autoregressive decoding of a
+   single sequence is **kernel-launch-bound, not compute-bound**: the GPU spends most
+   of its time idle between tiny operations. So it was genuinely slow *and* the GPU
+   looked underused.
+
+**Fix:** batched generation. We added `eval_batch_size` (16 on GPU) and decode many
+prompts at once using the tokenizer's **left-padding** — with left-padding every
+row's generated tokens start at the same column, so we can slice the shared prompt
+width off cleanly (`out[:, prompt_len:]`). We also print a running
+`done/total  running_acc  format_rate` line after each batch. Result: the GPU stays
+busy, the run finishes far faster, and you can watch the accuracy estimate converge.
+
+> *This is a preview of the Phase 7 insight:* generation is the slow part of RL, and
+> batching is the first lever. We'll revisit it properly (vLLM, paged KV-cache) as
+> the systems stretch goal.
+
+*No conceptual bugs in the reward logic this phase* — the upfront test cases caught
+nothing broken, which is exactly the point of writing them first. Extraction also
+held up on the real model: Qwen emitted `<answer> $400 </answer>` and we correctly
+parsed `400` (the `$` and spacing handled by `normalize_number`).
 
 #### Checkpoint (what "done" looks like)
+
+*CPU smoke (dev machine):*
 ```
 $ python -m pytest tests/test_rewards.py -q
 29 passed in 0.16s
 
 $ python eval.py --config tiny
 [eval] SmolLM2-135M on 8 test examples (greedy=True)
-[eval] accuracy = 0.125  format_rate = 0.000
+[eval] accuracy = 0.125  format_rate = 0.000   # tiny smoke model, not the baseline
 ```
-The pipeline runs end-to-end on CPU. Two things to read from that output:
-1. **format_rate = 0** — the tiny model ignores our tag format entirely and just
-   writes prose. That's fine; it's the "before" state. Getting that rate up is part
-   of what training will do.
-2. **accuracy = 0.125** — this is the *tiny smoke model's* score on 8 examples, **not**
-   our real baseline. The honest baseline "X%" must be measured on the GPU box with
-   `python eval.py --config gpu --set eval_n=200` (Qwen2.5-1.5B, 200 examples). We'll
-   record that number when we first rent the GPU.
 
-**Status: ✅ Phase 1 done.** Next: Phase 2 — the rollout engine, where we sample
-*groups* of answers and compute per-token log-probabilities (the most bug-prone part
-of the whole project).
+*The real baseline (GPU box) — this is our "X%":*
+```
+$ python eval.py --config gpu --set eval_n=200
+[eval] Qwen/Qwen2.5-1.5B-Instruct on 200 test examples (greedy=True)
+...
+[eval] 200/200  running_acc=0.555  format_rate=0.755
+[eval] accuracy = 0.555  format_rate = 0.755
+```
+
+**📌 BASELINE (the "before" number we'll beat):**
+
+| Metric | Value | Setup |
+|--------|-------|-------|
+| **Accuracy** | **55.5%** | Qwen2.5-1.5B-Instruct, 200 GSM8K test examples, greedy |
+| **Format rate** | **75.5%** | fraction using `<think>/<answer>` correctly |
+
+How to read this:
+1. **55.5% is a healthy starting point.** Low enough that there's real room to
+   improve, high enough that the task isn't hopeless for the base model. This is the
+   X in our "X% → Y%" story.
+2. **75.5% format rate is a useful second signal.** The instruct model *already*
+   follows the format ~3 times out of 4 unprompted. So during training we can watch
+   two things move separately: format compliance climbing toward ~100% (the easy
+   win) and *correctness* climbing (the real win). Keeping the format reward small
+   ensures the model can't fake progress on the second by maxing the first.
+3. **Extraction held up on the real model** — `<answer> $400 </answer>` parsed to
+   `400`, fraction-style reasoning didn't confuse it. No reward-side fixes needed.
+
+**Status: ✅ Phase 1 done.** Baseline locked at **55.5% / 75.5%**. Next: Phase 2 —
+the rollout engine, where we sample *groups* of answers and compute per-token
+log-probabilities (the most bug-prone part of the whole project).
 
 ---
 

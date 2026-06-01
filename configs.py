@@ -72,6 +72,7 @@ class Config:
     # --- eval ---
     eval_n: int = 8
     eval_temperature: float = 0.0            # 0 => greedy
+    eval_batch_size: int = 2                 # prompts decoded together (GPU util)
     eval_every: int = 0                      # 0 disables periodic eval during training
 
     # --- logging ---
@@ -122,6 +123,7 @@ _PRESETS: dict[str, dict[str, Any]] = {
         grad_accum_steps=4,
         max_steps=500,
         eval_n=200,
+        eval_batch_size=16,
         eval_every=50,
     ),
 }
