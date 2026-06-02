@@ -356,4 +356,115 @@ log-probabilities (the most bug-prone part of the whole project).
 
 ---
 
-<!-- Phase 2 entry goes here -->
+### Phase 2 — The rollout engine
+
+> "Rollout" = letting the model generate answers. In RL we **make our own training
+> data**: the model's own samples are what we learn from. This phase builds the
+> machine that (a) samples a *group* of answers per question and (b) records, for
+> every generated token, how confident the model was — its **log-probability**.
+> That per-token confidence is the exact quantity GRPO will push up or down.
+>
+> The plan flags this as *the most bug-prone phase*. Most "loss is NaN / nothing
+> learns" disasters are actually a silent log-prob or masking bug here. So we wrote
+> the tests first and pinned the alignment down to the index.
+
+#### What we did
+
+| File | What it is, in plain terms |
+|------|----------------------------|
+| `rollout.py` | Samples G completions per question, then scores each generated token with its log-probability. Returns a tidy `Rollout` bundle (token ids, masks, log-probs, rewards, decoded text). |
+| `tests/test_rollout.py` | 7 fast tests (no model download) that nail the two danger zones: the logit→token *shift* and the *completion mask*. |
+
+#### The two ideas you must get exactly right
+
+**1. The logit→token "off-by-one" shift.** A language model reads tokens
+left-to-right and, at each position, predicts the *next* token. So the model's
+opinion about the token at position `t+1` lives in its output at position `t`. If
+you pair them up wrong by one slot, every log-prob is attributed to the wrong token
+and training quietly learns nonsense.
+
+We handle it with one clear convention, the **scored frame**: for a sequence of
+length `T` there are `T-1` scored positions (you can't score the very first token —
+nothing comes before it). Scored slot `k` holds *"how likely was the token at full
+position `k+1`, given everything up to `k`."* In code:
+```python
+logits  = model(...).logits[:, :-1, :]   # drop the last step (predicts past the end)
+targets = input_ids[:, 1:]               # drop the first token (unscoreable)
+logp[k] = log_softmax(logits[k])[targets[k]]
+```
+
+**2. The completion mask.** We must train **only on tokens the model generated** —
+never the prompt (the model didn't choose those), never padding, and nothing after
+the end-of-sequence (EOS) token. So we build a mask that is `1` exactly on real
+generated tokens and `0` everywhere else, and *every* later sum/average over tokens
+is taken under it. The mask is built in the same scored frame so it lines up with
+the log-probs element-for-element. That alignment is the whole game.
+
+#### How it's used later
+- `generate_group` is called at the top of every Phase 4 training step to produce
+  the batch of completions we learn from.
+- The log-probs it records become **`logp_old`** — the "before" snapshot. In Phase 3
+  the loss compares the *current* policy's fresh log-probs against this `logp_old` to
+  decide how much each token's probability changed.
+- `rewards` (per completion) feed the group-advantage computation in Phase 3.
+- The `completion_mask` is reused in every masked mean inside the loss.
+
+#### Design choices worth noting
+- **Group-contiguous batch layout.** Rows are ordered `[prompt0×G, prompt1×G, ...]`
+  via repeat-interleave, so Phase 3 can reshape to `[num_prompts, G]` and compute
+  per-group statistics with no bookkeeping.
+- **EOS-aware mask, keeping the EOS token.** After a row emits EOS, `generate` fills
+  the rest with padding; we mask those out but *keep the EOS token itself* trainable
+  (learning *when to stop* matters).
+- **Memory-frugal log-probs.** Instead of materialising a full
+  `[batch, length, vocab]` log-softmax (which for Qwen's ~150k vocab can be tens of
+  GB), we compute `selected_logit − logsumexp(logits)`. Same answer, a fraction of
+  the memory. We also cast logits to fp32 before the `logsumexp` for numerical safety
+  even when the model runs in bf16.
+- **`compute_logprobs` is deliberately *not* `no_grad`.** Phase 2 calls it inside
+  `no_grad` (the old policy is fixed), but Phase 3 calls the *same* function through
+  the trainable policy and needs gradients to flow. So the function stays
+  grad-agnostic and the caller decides.
+
+#### Problems hit & how we fixed them
+*No bugs survived to runtime* — which is the point of writing the tests first. The
+trickiest part conceptually was deciding **where** to apply the shift so the mask and
+log-probs stay aligned. We resolved it by committing to a single "scored frame"
+convention (documented at the top of `rollout.py`) and adding
+`test_full_to_scored_frame_alignment`, which proves that the first generated token
+(full position = `prompt_len`) maps to the right scored index after the shift.
+
+#### Checkpoint (what "done" looks like)
+```
+$ python -m pytest tests/ -q
+36 passed in 5.11s          # 29 reward + 7 rollout
+
+$ python rollout.py --config tiny --set group_size=4
+[rollout] 1 prompt x G=4 -> 4 rows
+[rollout] full_ids (4, 193)  logp_old (4, 192)  completion_mask (4, 192)
+--- completion 0 | reward=0.00 correct=0 len=64 tokens ---
+To find the cost of the computer, ...
+... (4 genuinely different samples of the same question) ...
+[rollout] masked scored tokens = 256  (== sum of completion lengths = 256)
+[rollout] OK
+```
+Read the output:
+1. **Shapes line up:** `full_ids` is length 193, and `logp_old`/`completion_mask`
+   are 192 = `T-1`. The scored frame is exactly one shorter, as designed.
+2. **The invariant holds:** masked token count (256) equals the summed completion
+   lengths (4 × 64). If these ever disagree, the mask is wrong — this is our
+   tripwire.
+3. **Sampling explores:** the 4 completions are visibly different reasonings for the
+   same question — exactly what we need so a *group* has variety to rank.
+4. Rewards are all 0 here (tiny model, wrong answers) — expected; we're testing the
+   plumbing, not the model.
+
+**Status: ✅ Phase 2 done.** The rollout engine samples groups and scores tokens with
+verified alignment. Next: Phase 3 — turn rewards + log-probs into the **GRPO loss**
+(group-relative advantages + the clipped policy-gradient objective + KL). This is the
+algorithm itself, and almost all of it is checkable on CPU against hand-computed
+numbers.
+
+---
+
+<!-- Phase 3 entry goes here -->
