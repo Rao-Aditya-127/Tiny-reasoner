@@ -467,4 +467,124 @@ numbers.
 
 ---
 
-<!-- Phase 3 entry goes here -->
+### Phase 3 — Advantages & the GRPO loss (the core)
+
+> This is the phase. Everything before it was gathering ingredients — questions,
+> a scorer, sampled answers with their per-token confidences. Here we combine them
+> into **one number, the loss**, whose gradient *is* the GRPO learning rule. It's
+> also the part you'll explain in an interview, so the file is written to be read.
+>
+> The beautiful thing: it's pure tensor math, so we can check every line against
+> numbers worked out by hand on CPU — no GPU, no model, no randomness.
+
+#### What we did
+
+| File | What it is, in plain terms |
+|------|----------------------------|
+| `grpo.py` | Two functions. `group_advantages`: turn each completion's reward into "how much better than your group were you?". `grpo_loss`: turn those advantages + the log-probs into a single scalar loss to backprop. |
+| `tests/test_grpo.py` | 12 tests, each pinned to a hand-computed value: the advantage formula, the ratio=1 identity, the KL estimator, one-sided clipping, and masking. |
+
+#### The algorithm in four moves (plain English)
+
+**Move 1 — Group-relative advantage (GRPO's whole trick).**
+For a group of G answers to the *same* question, the group's **average reward is the
+baseline**. Each answer's advantage is how far above/below that average it landed,
+scaled by the group's spread:
+```
+A_i = (reward_i − group_mean) / (group_std + ε)
+```
+Beat your siblings → positive advantage → "do more of this." Lagged → negative →
+"do less." No critic network, no value function — *the siblings are the baseline.*
+That's why GRPO is cheap. A subtle but important case: if every answer in a group
+ties (all right or all wrong), the advantage is **0** for all of them — and that's
+correct, because the group gives no information about which answer was better.
+
+**Move 2 — The policy ratio.**
+We sampled the answers with one version of the model (call its confidences
+`logp_old`). After a gradient step the model changes; we re-score the same tokens to
+get `logp_new`. The **ratio** `exp(logp_new − logp_old)` says, per token, "how much
+more likely is the *new* model to say this than the old one?" (Exponentiating a
+difference of logs turns it back into a probability ratio.)
+
+**Move 3 — The clipped surrogate (borrowed from PPO).**
+We want to increase the probability of tokens with positive advantage. Naively
+multiplying `ratio × advantage` lets one batch shove the model too far. PPO's fix:
+```
+min( ratio·A ,  clip(ratio, 1−ε, 1+ε)·A )
+```
+The clip caps how much a single update can reward a token. Crucially it's
+**one-sided in effect**: it stops us *over-shooting* on good tokens, but it does not
+soften the push *away* from bad ones — exactly the asymmetry we verified in a test.
+
+**Move 4 — The KL leash.**
+Chasing reward can make a model degenerate (e.g. spam one phrase). So we add a
+penalty for drifting from a frozen **reference** model. We use the **k3 estimator**
+`exp(Δ) − Δ − 1` (with `Δ = logp_ref − logp_new`), which is **always ≥ 0** and
+low-variance — much better behaved than the naive `logp_new − logp_ref`, which can
+go negative and destabilize training.
+
+**Putting it together:** per-token loss = `−(clipped surrogate) + β·KL`, then
+**averaged only over real generated tokens** (the mask from Phase 2). We minimise it;
+the minus sign is because we *maximise* the surrogate objective.
+
+#### How it's used later
+- Phase 4's training loop calls `group_advantages(rollout.rewards, G)` then
+  `grpo_loss(logp_new, rollout.logp_old, advantages, rollout.completion_mask, ...)`,
+  calls `.backward()`, and steps the optimizer. That's the entire update.
+- The returned **metrics dict** (mean ratio, mean KL, clip fraction, mean advantage)
+  becomes the per-step logging in Phase 4–5 that tells us whether training is healthy
+  (e.g. KL not exploding, clip fraction reasonable).
+- The `normalize` flag (Move 1) and `loss_agg` choice (below) are wired to config so
+  Phase 6 can run the Dr. GRPO / DAPO ablations *without touching this code*.
+
+#### Design choices worth noting
+- **Advantage is one scalar per completion, broadcast to all its tokens.** GRPO is
+  *outcome-supervised*: the whole answer earns one reward, and every token in it
+  shares the credit/blame. We broadcast `[B] → [B, 1] → [B, L]` at loss time.
+- **Token-averaging is a real, named choice.** `loss_agg="seq"` (default) averages
+  per sequence then over sequences — the *original* GRPO. `loss_agg="token"` does one
+  global mean over all tokens — the **DAPO** fix. They differ in how much long answers
+  are weighted, the exact bias **Dr. GRPO** critiques. We expose both and will ablate
+  in Phase 6 rather than silently baking one in.
+- **Memory-frugal, numerically safe.** Metrics are computed under `no_grad`; the KL
+  term is skipped entirely when `kl_beta=0` (the no-KL ablation) so we don't pay for a
+  reference forward pass we won't use.
+
+#### Problems hit & how we fixed them
+No runtime bugs — the hand-computed tests are exactly so that "looks right" becomes
+"is right." The one genuinely *important decision* (not a bug) was the **token-
+averaging scheme**. It's tempting to pick one and move on, but it materially changes
+the gradient and is the subject of active research (DAPO, Dr. GRPO). We resolved it by
+making it a parameter with the original-GRPO behaviour as default, and writing it down
+here so future-us remembers it's a lever, not a constant.
+
+#### Checkpoint (what "done" looks like)
+```
+$ python -m pytest tests/ -q
+48 passed in 7.05s          # 29 reward + 7 rollout + 12 grpo
+
+# gradient-flow sanity (2 prompts x G=3, one masked token):
+loss 0.00218
+metrics {'mean_ratio': 1.0007, 'mean_kl': 0.0, 'clip_frac': 0.0, 'mean_adv': 0.0}
+grad on logp_new finite: True
+grad nonzero on masked token [0,3]: -0.0      # masking kills the gradient here
+grad sum abs: 0.9417                          # real learning signal everywhere else
+```
+What this proves:
+1. **Every formula matches hand arithmetic** — advantages (`(3,1,1,−1) → (√2,0,0,−√2)`),
+   the ratio=1 identity (loss = −mean advantage), the k3 KL (`e^0.5−0.5−1`), and the
+   one-sided clip all hit their expected values.
+2. **`mean_adv = 0`** — advantages are zero-mean within each group, as the baseline
+   subtraction requires. (Sanity that we grouped correctly.)
+3. **The loss actually backprops** with finite gradients, and the **masked token gets
+   exactly zero gradient** — so the prompt/padding can never leak into the update.
+
+**Status: ✅ Phase 3 done.** The algorithm is implemented and verified in isolation.
+Next: Phase 4 — wire rollout + rewards + loss into a real **training loop**, add the
+reference model (LoRA-adapters-disabled trick), and run the make-or-break **overfit
+test**: can we drive reward up on 10–50 problems? That's the first time we'll need the
+GPU again.
+
+---
+
+<!-- Phase 4 entry goes here -->
