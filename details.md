@@ -587,4 +587,108 @@ GPU again.
 
 ---
 
-<!-- Phase 4 entry goes here -->
+### Phase 4 — The training loop, end to end
+
+> Now the pieces meet. This phase wires rollout → rewards → advantages → loss →
+> `backward()` → optimizer step into one loop, adds the reference model for KL, and
+> runs the **make-or-break sanity check**: can we drive reward *up* on a tiny set of
+> problems? If yes, the algorithm is correct and we're allowed to scale. If no, the
+> bug is upstream in Phase 2/3 and scaling would just waste GPU money.
+
+#### What we did
+
+| File | What it is, in plain terms |
+|------|----------------------------|
+| `train.py` | The loop. Each step: sample a group of answers, score them, compute advantages, re-score under the current model, compute the GRPO loss, backprop, clip, step. Logs every metric and saves the trained weights at the end. |
+| `utils.trainable_parameters` | Returns the params the optimizer should touch (all of them, or just the LoRA adapters). |
+
+#### Key concepts (plain English)
+
+**The reference model — and the LoRA trick.** The KL term needs a *frozen* copy of
+the original model to measure drift. The naive way is to keep a second full model in
+memory (expensive). The trick: with **LoRA**, training only touches small add-on
+"adapter" weights while the big base model stays frozen. So the reference model is
+just *the policy with its adapters switched off* — one line, `with
+policy.disable_adapter():`, and zero extra memory. (On the CPU `tiny` config we don't
+use LoRA, so there we *do* load a small second copy — fine for a 135M model.)
+
+**Why we re-score the same tokens we just generated.** During the rollout we recorded
+`logp_old` with no gradients (it's a fixed snapshot). To actually *learn*, we run the
+tokens through the model **again, with gradients on**, producing `logp_new`. Only this
+second pass builds the computation graph that `backward()` needs. Since no optimizer
+step has happened between sampling and re-scoring, `logp_new == logp_old` and the
+ratio is exactly 1 on each update — which is the correct, expected behaviour for one
+gradient step per rollout (the clip simply doesn't engage in this regime).
+
+**Gradient accumulation & clipping.** We scale each step's loss by
+`1/grad_accum_steps` and only call `optimizer.step()` every N steps — this simulates a
+bigger batch than fits in memory (GRPO is more stable with larger, less-noisy group
+statistics). We also clip the gradient norm so one weird batch can't blow up the
+weights.
+
+**The overfit sanity check.** `--overfit` shrinks the data to a tiny fixed pool
+(default 16 problems) and trains on it repeatedly. On a *capable* model the reward
+should climb fast — that's proof the gradient points the right way. It's the cheapest
+possible "is the whole thing correct?" test before a real run.
+
+#### How it's used later
+This same loop *is* Phase 5 — the real run is just `train.py --config gpu` (no
+`--overfit`) with a bigger pool and more steps. Phase 6's ablations are this loop with
+different config flags (`kl_beta=0`, `normalize_advantage=false`, `loss_agg=token`,
+varying `group_size`). The saved `runs/<name>/final` weights are what `eval.py` loads
+to produce the trained accuracy.
+
+#### Design choices worth noting
+- **One update per rollout (ratio≈1).** We keep the simplest correct form: sample,
+  take one gradient step, resample. (Doing multiple inner epochs per rollout is what
+  would make the clip actually bite — a possible later extension.)
+- **KL term is fully optional.** `kl_beta=0` skips the reference forward pass entirely
+  — both a speed win and the Phase 6 no-KL ablation, with no code change.
+- **A built-in profiler.** Every step logs `t_rollout` vs `t_update`. Even on CPU you
+  can see generation is a big chunk of the time — the seed of the Phase 7 story.
+
+#### Problems hit & how we fixed them
+No crashes — the loop ran clean on the first try, which is the payoff of having tested
+Phases 2 and 3 in isolation. The main thing to *understand* (not fix) is the output:
+**`loss` prints as ~0 while gradients are clearly non-zero.** That's not a bug. With
+ratio = 1 and advantages that are zero-mean within each group, the loss *value* is
+≈ 0, but its *gradient* — `−mean(advantage · ∇logp_new)` — is not. **Loss value ≈ 0
+does not mean gradient ≈ 0.** This trips up everyone the first time.
+
+#### Checkpoint (what "done" looks like)
+
+*CPU smoke (dev machine) — the loop runs end-to-end with no NaNs:*
+```
+[train] SmolLM2-135M | steps=3 prompts/step=2 G=2 pool=8 kl=on overfit=True
+[step 0] reward=0.000  frac_correct=0.000  ratio=1.000  grad_norm=0.0000  ...
+[step 1] reward=0.250  frac_correct=0.250  ratio=1.000  grad_norm=2.2839  ...
+[step 2] reward=0.000  frac_correct=0.000  ratio=1.000  grad_norm=0.0006  ...
+[train] done. saved to runs/tiny/final
+```
+This tiny run accidentally became the **clearest possible demo of GRPO's group
+baseline**:
+- **Step 1 has a real gradient (`grad_norm=2.28`); steps 0 and 2 have ~zero.** Why?
+  Step 1's group of answers was *mixed* (one of four correct → `frac_correct=0.25`),
+  so some advantages were positive and some negative → a learning signal. Steps 0 and
+  2 had *all answers wrong* → every reward tied → all advantages zero → **no gradient**.
+  That is GRPO working exactly as designed: *you only learn from a question when the
+  group disagrees about it.*
+- **`ratio=1.000` throughout** — confirms the on-policy single-update regime.
+- **No NaNs, weights saved.** The plumbing is correct.
+
+**⏳ Still pending — the real overfit test (GPU).** The 135M CPU model can't actually
+*get better* in 3 steps; "reward climbs" must be shown on the capable model. The gate
+to pass before Phase 5 is:
+```
+python train.py --config gpu --overfit --set max_steps=60
+```
+and watch `reward` / `frac_correct` trend **upward** over steps with KL staying
+bounded. (Memory levers if it OOMs on a 24 GB card: lower `prompts_per_step`,
+`group_size`, or `max_new_tokens`.) We'll record that curve here when it's run.
+
+**Status: ✅ Phase 4 loop built & CPU-verified; ⏳ GPU overfit gate pending.** Next,
+once reward is confirmed climbing: Phase 5 — the real training run on full GSM8K.
+
+---
+
+<!-- Phase 5 entry goes here -->

@@ -68,6 +68,10 @@ class Config:
     grad_accum_steps: int = 1
     max_steps: int = 3
     weight_decay: float = 0.0
+    loss_agg: str = "seq"                    # "seq" (orig GRPO) | "token" (DAPO)
+    gradient_checkpointing: bool = False     # trade compute for memory on GPU
+    overfit_n: int = 16                      # fixed pool size for --overfit sanity
+    log_every: int = 1
 
     # --- eval ---
     eval_n: int = 8

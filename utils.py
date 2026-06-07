@@ -75,6 +75,11 @@ def load_model_and_tokenizer(cfg: Config, *, for_training: bool):
     return model, tokenizer, device
 
 
+def trainable_parameters(model):
+    """The parameters an optimizer should update (all of them, or just LoRA)."""
+    return [p for p in model.parameters() if p.requires_grad]
+
+
 class JsonlLogger:
     """Append one JSON line of metrics per step to runs/<name>/metrics.jsonl and
     echo a compact summary to the console. Optionally mirrors to wandb."""
