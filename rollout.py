@@ -72,13 +72,20 @@ def compute_logprobs(model, input_ids: torch.Tensor,
     """
     logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
     # logits[:, k] predicts token k+1, so drop the last step; targets drop the first.
-    logits = logits[:, :-1, :].float()        # [B, T-1, V], fp32 for stable logsumexp
-    targets = input_ids[:, 1:]                # [B, T-1]
-    # Memory-frugal log-softmax-then-gather: select the target logit and subtract the
-    # log-partition, avoiding a full [B, T-1, V] log_softmax materialisation.
-    selected = logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1)   # [B, T-1]
-    logp = selected - torch.logsumexp(logits, dim=-1)                 # [B, T-1]
-    return logp
+    logits = logits[:, :-1, :]                # [B, T-1, V]
+    targets = input_ids[:, 1:]               # [B, T-1]
+    bsz, length, vocab = logits.shape
+    # cross_entropy is a fused, numerically-stable log_softmax+gather. Crucially it
+    # does NOT materialise a second full [B, T-1, V] tensor (the old `.float()` copy
+    # did, doubling peak memory and OOM-ing the LM-head logits on a 16 GB card).
+    # NLL = -log p(target), so the log-prob is its negation. We upcast only the tiny
+    # [B, T-1] result to fp32 so downstream ratio/KL math stays stable.
+    nll = torch.nn.functional.cross_entropy(
+        logits.reshape(bsz * length, vocab),
+        targets.reshape(bsz * length),
+        reduction="none",
+    )
+    return (-nll).reshape(bsz, length).float()   # [B, T-1]
 
 
 def _generated_token_mask(gen_ids: torch.Tensor, eos_id: int | None) -> torch.Tensor:

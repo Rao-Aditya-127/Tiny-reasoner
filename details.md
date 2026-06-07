@@ -677,18 +677,143 @@ baseline**:
 - **No NaNs, weights saved.** The plumbing is correct.
 
 **⏳ Still pending — the real overfit test (GPU).** The 135M CPU model can't actually
-*get better* in 3 steps; "reward climbs" must be shown on the capable model. The gate
-to pass before Phase 5 is:
-```
-python train.py --config gpu --overfit --set max_steps=60
-```
-and watch `reward` / `frac_correct` trend **upward** over steps with KL staying
-bounded. (Memory levers if it OOMs on a 24 GB card: lower `prompts_per_step`,
-`group_size`, or `max_new_tokens`.) We'll record that curve here when it's run.
+*get better* in 3 steps; "reward climbs" must be shown on the capable model.
 
-**Status: ✅ Phase 4 loop built & CPU-verified; ⏳ GPU overfit gate pending.** Next,
-once reward is confirmed climbing: Phase 5 — the real training run on full GSM8K.
+##### Problem — CUDA out of memory on the first real GPU run (and what it taught us)
+A first GPU attempt OOM'd trying to allocate ~10 GiB in one go. The cause is worth
+remembering because it's fundamental to RL post-training, not a one-off:
+
+**The bottleneck is the LM-head logits, not the model weights.** The training forward
+produces a `[batch, tokens, vocab]` logits tensor, and Qwen's vocab is ~152k. With a
+big batch (e.g. group_size 8 × prompts_per_step 8 = 64 sequences) × ~640 tokens ×
+152k × 2 bytes that single tensor is **~12 GB**. We also found a **silent memory
+doubler**: `compute_logprobs` cast that whole logits tensor to fp32 (`.float()`),
+creating a second full copy.
+
+**Fix we kept (helps on *any* GPU):** replaced the manual `log_softmax`/`logsumexp`
+(which materialised an fp32 `[B, T, V]` copy) with a fused
+`F.cross_entropy(reduction="none")`, upcasting only the tiny `[B, T]` result to fp32.
+Same numbers (the unit tests still pass), roughly half the peak memory. We also set
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` at the top of `train.py`/`eval.py`
+to reduce fragmentation.
+
+> *The memory levers, in order of impact:* **batch size → sequence length → fp32
+> copies.** Gradient accumulation buys back effective batch size at no memory cost (it
+> just costs wall-clock). This is the same generation-vs-update tension that becomes
+> the Phase 7 systems story.
+
+We briefly added a 16 GB-tuned preset, then **reverted it** when the run moved to a
+larger card. Final hardware: an **L4 (24 GB)**. The standard `gpu` preset was retuned
+to fit 24 GB — in-memory batch `group_size 8 × prompts_per_step 2 = 16 sequences`,
+with `grad_accum_steps=8` recovering 16 questions per optimizer update.
+
+##### Problem — the first overfit run looked flat (and why it wasn't a bug)
+The first attempt (`--set max_steps=60`, default `grad_accum_steps=8`, `lr=1e-6`)
+produced a *noisy, flat* reward around 0.4–0.9 — no clear climb. Two under-powered
+settings, not an algorithm fault:
+1. **Too few real updates.** `grad_accum_steps=8` means the optimizer fires once every
+   8 steps → only **~7 updates** in 60 steps. At `lr=1e-6`, seven tiny LoRA updates
+   barely move a 1.5B model. (Tell-tale sign: `grad_norm` printed a real number only
+   once.)
+2. **Problem-sampling noise.** With a 16-problem pool and 2 prompts/step, each step saw
+   a *different* pair — so step-to-step reward swings reflected *which* problems were
+   drawn, not learning.
+
+**Fix for a decisive test:** shrink to **2 fixed problems** (`overfit_n=2`), sample
+them every step (no sampling noise), update every step (`grad_accum_steps=1` → 100
+real updates), and raise `lr` to `1e-5`:
+```
+python train.py --config gpu --overfit \
+  --set overfit_n=2 prompts_per_step=2 grad_accum_steps=1 lr=1e-5 max_steps=100
+```
+
+##### Checkpoint — GATE PASSED ✅
+```
+[step  ~0] reward≈0.6    frac_correct≈0.6    kl≈0.00
+[step  78] reward=0.9750 frac_correct=0.875  kl=0.050  grad_norm=0.23
+[step  84] reward=1.1000 frac_correct=1.000  kl=0.043  grad_norm=0.01
+[step  90] reward=1.0938 frac_correct=1.000  kl=0.062  grad_norm=0.35
+[step  99] reward=1.0375 frac_correct=0.9375 kl=0.049  grad_norm=0.30
+```
+What this proves — the whole pipeline is correct end to end:
+- **Reward climbs from ~0.6 to ~1.0–1.1** and `frac_correct` reaches a perfect **1.0**
+  on several steps (1.1 = correct answer + format bonus, the maximum). The GRPO
+  gradient genuinely drives the model toward solving the problems.
+- **KL grew 0 → ~0.05 and stayed bounded** — the model adapted *without* drifting into
+  degeneracy. The KL leash is doing its job.
+- **`grad_norm` finite (0.2–0.7), no NaNs, `ratio=1.0`** throughout — healthy
+  single-update on-policy training.
+- **`loss` still ≈ 0** the whole time, exactly as explained above — proof that loss
+  value is the wrong meter and reward is the right one.
+
+> **The lesson worth keeping:** an overfit sanity check is only meaningful if you give
+> it enough *optimizer updates* and a big enough *learning rate* to actually move the
+> model — and you remove confounds (sample the same few problems every step). Watch
+> reward, not loss; watch the *trend*, not single steps.
+
+**Status: ✅ Phase 4 done — overfit gate passed.** The from-scratch GRPO loop provably
+learns. Next: Phase 5 — the real training run on full GSM8K (drop `--overfit`), with
+periodic eval to plot held-out accuracy climbing above the 55.5% baseline.
 
 ---
 
-<!-- Phase 5 entry goes here -->
+### Phase 5 — Make it actually learn to reason (the real run)
+
+> Phase 4 proved the loop *can* learn (it memorized 2 problems). Phase 5 is the
+> actual experiment: train on the *full* dataset and show held-out accuracy rising
+> above the **55.5% baseline**, with reasoning getting longer/cleaner. Same
+> `train.py` — just drop `--overfit`, add periodic evaluation, and let it run.
+
+#### What we added
+- **Periodic held-out eval inside training.** Every `eval_every` steps (and at step 0
+  for the in-loop baseline, and once at the end) we greedy-decode a *fixed* 200-example
+  test set and log `eval_acc` / `eval_format`. Fixed set = the accuracy curve is
+  apples-to-apples across checkpoints.
+- **Checkpointing.** We save the best-accuracy adapter to `runs/gpu/best` and the last
+  to `runs/gpu/final`, so the trained model can be re-evaluated later.
+- **Qualitative sample dumps.** At each eval we write the first 3 test completions to
+  `runs/gpu/samples_step{N}.txt`. Because they're the *same* questions every time, you
+  can literally read step 0 vs step 600 side by side and watch the reasoning grow —
+  the R1-style "aha" visualization.
+
+#### Config for the run (tuned, with reasons)
+| Setting | Value | Why |
+|---|---|---|
+| `num_train_examples` | 1024 | enough variety that the model isn't just memorizing a tiny pool |
+| `max_steps` | 600 | fits the ~3–6 hr L4 budget (rollout dominates wall-clock) |
+| `grad_accum_steps` | 4 | → ~150 optimizer updates (the overfit test showed ~7 updates was far too few) |
+| `lr` | 2e-6 | nudged up from the ultra-safe 1e-6; the overfit test learned well at 1e-5, so 2e-6 is a conservative-but-not-glacial choice for diverse data |
+| `group_size` | 8 | clean group-relative advantage statistics |
+| `prompts_per_step` | 2 | keeps the in-memory batch at 16 sequences (24 GB-safe) |
+| `kl_beta` | 0.02 | leash against degeneration; we saw it stay ~0.05 and bounded in Phase 4 |
+| `eval_every` / `eval_n` | 100 / 200 | ~6 curve points without eval dominating wall-clock |
+
+#### How to run it
+```
+python train.py --config gpu          # full run, no --overfit
+```
+Then plot `eval_acc` over `step` from `runs/gpu/metrics.jsonl`, and diff the
+`samples_step*.txt` files for the reasoning-growth story.
+
+#### What we're watching
+- **`eval_acc` rising above 0.555** — the headline. Even +5–10 points is a real result;
+  references reach ~70–90% with more compute.
+- **`reward` / `frac_correct`** climbing on the training rollouts (the leading
+  indicator; eval confirms it generalizes).
+- **`kl` bounded** (not exploding) and **no reward-hacking** (format rate up is fine,
+  but correctness must rise too, not just format).
+- **`comp_len`** — does the model start writing longer, more structured reasoning?
+
+#### Failure modes to react to (and the lever)
+- *Accuracy flat after step 100–200* → too few/too-small updates: raise `lr` (e.g.
+  3–5e-6) or lower `grad_accum_steps`.
+- *KL climbing fast / output degenerating* → lower `lr` or raise `kl_beta`.
+- *Reward up but eval flat* → reward hacking or overfitting the train pool; check the
+  format-vs-correctness split and increase `num_train_examples`.
+
+**Status: ⏳ Phase 5 plumbing built & CPU-smoke-verified; full GPU run pending.** The
+result curve and before/after samples will be recorded here once the run completes.
+
+---
+
+<!-- Phase 6 entry goes here -->

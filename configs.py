@@ -110,25 +110,30 @@ _PRESETS: dict[str, dict[str, Any]] = {
         max_steps=3,
         eval_n=8,
     ),
+    # Tuned to fit a 24 GB card (L4 / RTX 4090). The in-memory batch is
+    # group_size * prompts_per_step = 16 sequences; the LM-head logits
+    # [B, T, ~152k vocab] dominate memory, so we keep B small and recover the
+    # effective batch (16 questions / update) via grad accumulation. On a 48 GB
+    # card you can raise prompts_per_step (e.g. 6-8) for faster, less-noisy steps.
     "gpu": dict(
         name="gpu",
         model_name="Qwen/Qwen2.5-1.5B-Instruct",
         dtype="bfloat16",
         device="cuda",
         use_lora=True,
-        num_train_examples=512,
+        num_train_examples=1024,
         group_size=8,
-        prompts_per_step=8,
+        prompts_per_step=2,          # B = 16 sequences per forward
         max_new_tokens=512,
         temperature=0.9,
         kl_beta=0.02,
         clip_eps=0.2,
-        lr=1e-6,
-        grad_accum_steps=4,
-        max_steps=500,
+        lr=2e-6,                     # calibrated from the overfit test (1e-6 too slow)
+        grad_accum_steps=4,          # 8 questions/update -> ~150 updates over 600 steps
+        max_steps=600,
         eval_n=200,
-        eval_batch_size=16,
-        eval_every=50,
+        eval_batch_size=8,           # smaller during in-training eval to spare VRAM
+        eval_every=100,
     ),
 }
 

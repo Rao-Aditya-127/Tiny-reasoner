@@ -20,10 +20,14 @@ up on a tiny fixed set of problems, the bug is upstream (Phase 2/3), not here.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+
+# Reduce CUDA fragmentation on small (16 GB) cards. Must be set before torch inits CUDA.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
@@ -31,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from configs import get_config, parse_overrides
 from data import load_gsm8k
+from eval import evaluate
 from grpo import grpo_loss, group_advantages
 from rollout import compute_logprobs, generate_group
 from utils import JsonlLogger, load_model_and_tokenizer, set_seed, trainable_parameters
@@ -76,13 +81,47 @@ def train(cfg, *, overfit: bool) -> None:
 
     pool = load_gsm8k("train", n=cfg.num_train_examples, seed=cfg.seed)
     logger = JsonlLogger(cfg)
+    run_dir = Path(cfg.log_dir) / cfg.name
     print(f"[train] {cfg.model_name} | steps={cfg.max_steps} "
           f"prompts/step={cfg.prompts_per_step} G={cfg.group_size} "
           f"pool={len(pool)} kl={'on' if use_kl else 'off'} overfit={overfit}")
 
+    # Held-out eval set, fixed across the run so the accuracy curve and the
+    # qualitative samples (same questions every time) are directly comparable.
+    eval_examples = load_gsm8k("test", n=cfg.eval_n, seed=cfg.seed) if cfg.eval_every else []
+    best_acc = -1.0
+
+    def run_eval(at_step: int) -> None:
+        nonlocal best_acc
+        if not eval_examples:
+            return
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        policy.eval()
+        with torch.no_grad():
+            acc, fmt, rows = evaluate(policy, tokenizer, device, eval_examples, cfg,
+                                      dump=0)
+        policy.train()
+        logger.log(at_step, {"eval_acc": acc, "eval_format": fmt})
+        # Dump the first few completions (same questions each eval -> shows reasoning
+        # growing over training, the R1-style "aha" visualization).
+        with open(run_dir / f"samples_step{at_step}.txt", "w", encoding="utf-8") as fh:
+            for ex, comp, parts in rows[:3]:
+                fh.write(f"Q: {ex.question}\nGOLD: {ex.gold}  "
+                         f"CORRECT: {parts['is_correct']:.0f}\n"
+                         f"COMPLETION:\n{comp}\n{'=' * 70}\n")
+        if acc > best_acc:
+            best_acc = acc
+            policy.save_pretrained(str(run_dir / "best"))
+
     optimizer.zero_grad()
     accum = 0
+    last_grad_norm = float("nan")   # carried between optimizer steps for logging
     for step in range(cfg.max_steps):
+        # Periodic held-out eval (step 0 gives the in-loop baseline point).
+        if cfg.eval_every and step % cfg.eval_every == 0:
+            run_eval(step)
+
         t0 = time.time()
         # Pick this step's prompts (rotating window over the pool; for --overfit the
         # pool is tiny so we revisit the same problems repeatedly).
@@ -112,9 +151,9 @@ def train(cfg, *, overfit: bool) -> None:
         )
         (loss / cfg.grad_accum_steps).backward()
         accum += 1
-        grad_norm = float("nan")
         if accum == cfg.grad_accum_steps:
-            grad_norm = float(torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm))
+            last_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm))
             optimizer.step()
             optimizer.zero_grad()
             accum = 0
@@ -128,21 +167,22 @@ def train(cfg, *, overfit: bool) -> None:
                 "reward": float(rollout.rewards.mean()),
                 "frac_correct": float(frac_correct),
                 "comp_len": float(rollout.completion_lengths().float().mean()),
-                "loss": float(loss),
+                "loss": float(loss.detach()),
                 "kl": m["mean_kl"],
                 "ratio": m["mean_ratio"],
                 "clip_frac": m["clip_frac"],
-                "grad_norm": grad_norm,
+                "grad_norm": last_grad_norm,
                 "t_rollout": round(t_rollout, 2),
                 "t_update": round(t_update, 2),
             })
 
-    # Save the trained weights (LoRA adapters or full model) for Phase 5 eval.
-    out = Path(cfg.log_dir) / cfg.name / "final"
+    # Final held-out eval (the "after" number) + save the trained weights.
+    run_eval(cfg.max_steps)
+    out = run_dir / "final"
     policy.save_pretrained(str(out))
     tokenizer.save_pretrained(str(out))
     logger.close()
-    print(f"[train] done. saved to {out}")
+    print(f"[train] done. saved to {out} | best eval_acc={best_acc:.3f}")
 
 
 def main() -> None:
