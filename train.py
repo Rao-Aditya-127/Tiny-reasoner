@@ -64,7 +64,13 @@ def train(cfg, *, overfit: bool) -> None:
     policy, tokenizer, device = load_model_and_tokenizer(cfg, for_training=True)
     policy.train()
     if cfg.gradient_checkpointing:
-        policy.gradient_checkpointing_enable()
+        # Recompute activations in backward instead of storing them -> ~10x less
+        # activation memory, the lever that lets a large batch fit. use_reentrant=False
+        # is the modern variant; enable_input_require_grads is required so gradients
+        # flow back to the LoRA params through the (frozen) checkpointed base layers.
+        policy.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+        policy.enable_input_require_grads()
 
     # Reference model only needed for KL when we are NOT using LoRA (LoRA disables
     # adapters instead). Skip entirely when kl_beta == 0 (the no-KL ablation).
@@ -128,20 +134,29 @@ def train(cfg, *, overfit: bool) -> None:
         start = (step * cfg.prompts_per_step) % len(pool)
         batch = [pool[(start + i) % len(pool)] for i in range(cfg.prompts_per_step)]
 
-        # 1-3: rollout (old policy, no grad) + advantages.
+        # 1-3: rollout (old policy, no grad) + advantages. Disable gradient
+        # checkpointing during generation so the KV-cache is used (cached decoding is
+        # vastly faster); re-enable it for the training forward.
+        if cfg.gradient_checkpointing:
+            policy.gradient_checkpointing_disable()
         rollout = generate_group(policy, tokenizer, batch, cfg, device)
+        if cfg.gradient_checkpointing:
+            policy.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
         advantages = group_advantages(
             rollout.rewards, cfg.group_size,
             normalize=cfg.normalize_advantage, eps=cfg.adv_eps,
         )
         t_rollout = time.time() - t0
 
-        # 4-5: re-score under the current policy (WITH grad) + reference for KL.
+        # 4-5: reference log-probs FIRST (no-grad, freed immediately) so its transient
+        # logits don't overlap with the big logp_new graph, then re-score under the
+        # current policy WITH grad.
         t1 = time.time()
-        logp_new = compute_logprobs(policy, rollout.full_ids, rollout.attention_mask)
         logp_ref = (reference_logprobs(policy, ref_model, cfg,
                                        rollout.full_ids, rollout.attention_mask)
                     if use_kl else None)
+        logp_new = compute_logprobs(policy, rollout.full_ids, rollout.attention_mask)
 
         # 6: loss -> backward (scaled for grad accumulation).
         loss, m = grpo_loss(

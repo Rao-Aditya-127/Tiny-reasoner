@@ -110,29 +110,32 @@ _PRESETS: dict[str, dict[str, Any]] = {
         max_steps=3,
         eval_n=8,
     ),
-    # Tuned to fit a 24 GB card (L4 / RTX 4090). The in-memory batch is
-    # group_size * prompts_per_step = 16 sequences; the LM-head logits
-    # [B, T, ~152k vocab] dominate memory, so we keep B small and recover the
-    # effective batch (16 questions / update) via grad accumulation. On a 48 GB
-    # card you can raise prompts_per_step (e.g. 6-8) for faster, less-noisy steps.
+    # Tuned for an A100 80 GB. The memory ceiling in the TRAINING (backward) pass is
+    # stored activations: ~B * T * 28 layers of MLP intermediates, NOT the logits.
+    # B = group_size * prompts_per_step = 32 sequences keeps peak ~46 GB with headroom
+    # for a long run. grad_accum_steps=1 -> an optimizer update every step (~1000
+    # updates). To push utilization higher you can raise prompts_per_step to 6 (B=48)
+    # or enable gradient_checkpointing (trades compute for ~10x less activation memory,
+    # allowing B=64-128). For a 24 GB card: prompts_per_step=2, grad_accum_steps=4.
     "gpu": dict(
         name="gpu",
         model_name="Qwen/Qwen2.5-1.5B-Instruct",
         dtype="bfloat16",
         device="cuda",
         use_lora=True,
-        num_train_examples=1024,
+        gradient_checkpointing=True,  # recompute activations in backward (see train.py)
+        num_train_examples=2048,
         group_size=8,
-        prompts_per_step=2,          # B = 16 sequences per forward
+        prompts_per_step=4,          # B = 32 sequences per forward
         max_new_tokens=512,
         temperature=0.9,
         kl_beta=0.02,
         clip_eps=0.2,
         lr=2e-6,                     # calibrated from the overfit test (1e-6 too slow)
-        grad_accum_steps=4,          # 8 questions/update -> ~150 updates over 600 steps
-        max_steps=600,
+        grad_accum_steps=1,          # update every step -> ~1000 updates over the run
+        max_steps=1000,
         eval_n=200,
-        eval_batch_size=8,           # smaller during in-training eval to spare VRAM
+        eval_batch_size=32,          # A100 has room; faster in-training eval
         eval_every=100,
     ),
 }

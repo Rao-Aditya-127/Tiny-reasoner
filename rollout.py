@@ -135,6 +135,7 @@ def generate_group(model, tokenizer, examples, cfg, device) -> Rollout:
         temperature=cfg.temperature,
         top_p=cfg.top_p,
         pad_token_id=tokenizer.pad_token_id,
+        use_cache=True,   # force KV-cache (enabling grad checkpointing turns it off)
     )                                              # [B, prompt_len + gen_len]
     full_ids = gen
     bsz, total_len = full_ids.shape

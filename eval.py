@@ -85,15 +85,27 @@ def main() -> None:
     ap.add_argument("--config", default="tiny")
     ap.add_argument("--set", nargs="*", default=[], help="key=value overrides")
     ap.add_argument("--split", default="test")
+    ap.add_argument("--adapter", default=None,
+                    help="path to a trained LoRA adapter (e.g. runs/gpu/best) to "
+                         "evaluate the trained model instead of the base model")
     args = ap.parse_args()
 
     cfg = get_config(args.config, **parse_overrides(args.set))
     set_seed(cfg.seed)
     model, tokenizer, device = load_model_and_tokenizer(cfg, for_training=False)
+    if args.adapter:
+        # Load the trained LoRA weights on top of the base, then fold them in so eval
+        # runs at full base-model speed with no adapter overhead.
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, args.adapter)
+        model = model.merge_and_unload()
+        print(f"[eval] loaded + merged adapter from {args.adapter}")
     model.eval()
 
     examples = load_gsm8k(args.split, n=cfg.eval_n, seed=cfg.seed)
-    print(f"[eval] {cfg.model_name} on {len(examples)} {args.split} examples "
+    tag = args.adapter or cfg.model_name
+    print(f"[eval] {tag} on {len(examples)} {args.split} examples "
           f"(greedy={cfg.eval_temperature == 0.0})")
     acc, fmt, _ = evaluate(model, tokenizer, device, examples, cfg)
     print(f"\n[eval] accuracy = {acc:.3f}  format_rate = {fmt:.3f}")
