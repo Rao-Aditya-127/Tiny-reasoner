@@ -10,3 +10,4 @@ venv/
 wandb/
 .pytest_cache/
 grpo-from-scratch-plan.md
+plot.py
